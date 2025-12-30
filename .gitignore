@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environments
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Local scripts/variants
+Ver*.py
+*Copy*.py
+test.py
+
+# Folders to exclude
+Casino/
+Shorting Extracts/
+Yearly Activity/
+
+# Text exports/logs
+*.txt
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
