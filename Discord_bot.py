@@ -1,4 +1,6 @@
 import discord
+import io
+import csv
 from PIL import Image, ImageStat, ImageEnhance
 import pytesseract
 import re
@@ -223,9 +225,10 @@ async def on_message(message):
 - `!on` — Enable relaying messages to bound channels.
 - `!off` — Disable relaying messages to bound channels.
 - `!text` — Broadcast a message to all bound channels.
-- `!positions` — Display all current positions.
-- `!summary [YYYY-MM-DD]` — Daily summary for the given date (default: today). Also posts the EOD strategy summary to the alert channel.
-- `!eod` — Post the EOD strategy summary (open holdings + closed-trade metrics) to the alert channel.
+- `!positions` – Display all current positions.
+- `!summary [YYYY-MM-DD] [--local]` – Daily summary for the given date (default: today). `--local` skips the alert channel and posts EOD summary only to the source channel.
+- `!fees` – Upload broker activity CSV/TSV to import short borrow fees (admin only).
+- `!eod` – Post the EOD strategy summary (open holdings + closed-trade metrics) to the alert channel.
 - `!bind <description>` — Bind the current channel for relaying messages (admin only).
 - `!unbind` — Unbind the current channel (admin only).
 - `!list_bindings` — Show all bound channels (admin only).
@@ -271,6 +274,10 @@ async def on_message(message):
             try:
                 # Check for an optional date argument
                 parts = message.content.split()
+                send_alert = True
+                if any(p in ("--local", "--test") for p in parts):
+                    send_alert = False
+                parts = [p for p in parts if not p.startswith("--")]
                 if len(parts) > 1:
                     # Validate provided date
                     date_str = parts[1]
@@ -285,12 +292,41 @@ async def on_message(message):
                     await relay_to_bound_channels(summary)
                 await source_channel.send(summary)
                 # ✅ ALSO run EOD summary when !summary is run
-                await post_eod_summary(client)
+                await post_eod_summary(client, also_send_channel_id=SOURCE_CHANNEL_ID, send_alert=send_alert)
                 
             except ValueError:
                 await source_channel.send("@here Invalid date format. Please use YYYY-MM-DD, e.g., `!summary 2025-01-19`.")
             except Exception as e:
                 await source_channel.send(f"@here An error occurred: {str(e)}")
+
+        elif message.content.strip().lower().startswith("!fees"):
+            if message.author.id != AUTHORIZED_USER:
+                await source_channel.send("You are not authorized to use this command.")
+                return
+
+            if not message.attachments:
+                await source_channel.send("Attach your broker activity export (CSV/TSV) with `!fees`.")
+                return
+
+            handled = False
+            for attachment in message.attachments:
+                filename = attachment.filename.lower()
+                if not filename.endswith((".csv", ".tsv", ".txt")):
+                    continue
+                handled = True
+                file_path = f"./{attachment.filename}"
+                await attachment.save(file_path)
+                try:
+                    report = import_borrow_fees_csv(file_path)
+                    await source_channel.send(report)
+                except Exception as e:
+                    await source_channel.send(f"@here Fee import failed: {e}")
+                finally:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+
+            if not handled:
+                await source_channel.send("No CSV/TSV attachment found to import.")
         
         elif message.content.lower().startswith("!trade"):
             try:
@@ -522,10 +558,42 @@ def initialize_db():
             symbol TEXT NOT NULL,
             total_qty INTEGER NOT NULL,
             avg_cost REAL NOT NULL,
+            short_fees REAL DEFAULT 0,
             realized_pl REAL DEFAULT 0,
+            date_first_open TEXT NOT NULL, -- MM/DD/YY (original open date)
             date_start TEXT NOT NULL,   -- MM/DD/YY
             date_closed TEXT            -- MM/DD/YY or NULL
         )
+    ''')
+
+    # Add short_fees for existing DBs that were created before this column existed
+    cursor.execute("PRAGMA table_info(eod_shorts)")
+    cols = [row[1] for row in cursor.fetchall()]
+    if "short_fees" not in cols:
+        cursor.execute("ALTER TABLE eod_shorts ADD COLUMN short_fees REAL DEFAULT 0")
+    if "date_first_open" not in cols:
+        cursor.execute("ALTER TABLE eod_shorts ADD COLUMN date_first_open TEXT")
+        cursor.execute("UPDATE eod_shorts SET date_first_open = date_start WHERE date_first_open IS NULL")
+
+    # === Borrow fee history (deduped across uploads) ===
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS short_fee_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            fee_date TEXT NOT NULL,        -- YYYY-MM-DD
+            amount REAL NOT NULL,
+            description TEXT,
+            imported_at TEXT NOT NULL
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_short_fee
+        ON short_fee_history(symbol, fee_date, amount, description)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_short_fee_symbol_date
+        ON short_fee_history(symbol, fee_date)
     ''')
 
     # === Indexes for fast lookups ===
@@ -927,6 +995,331 @@ def determine_row_color(original_image, line_text, bounding_data):
     return "UNKNOWN"
 
 
+_BORROW_FEE_RE = re.compile(r"(?:^|\s)(?:C\s+)?STOCK BORROW FEE\s+([A-Z0-9.\-]+)\s*$", re.I)
+_BORROW_FEE_DESC_RE = re.compile(
+    r"(\d{1,2}/\d{1,2})\s+(?:C\s+)?STOCK BORROW FEE\s+([A-Z0-9.\-]+)",
+    re.I,
+)
+
+
+def _parse_fee_amount(raw):
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(",", "").replace("$", "")
+    if not s:
+        return None
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1]
+    try:
+        val = float(s)
+    except Exception:
+        return None
+    return -val if neg else val
+
+
+def _parse_fee_date(raw):
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.split()[0]
+    for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def _parse_desc_fee_date(desc, row_date):
+    if not desc:
+        return None, None
+    match = _BORROW_FEE_DESC_RE.search(desc)
+    if not match:
+        return None, None
+    if row_date is None:
+        return None, None
+    month_day = match.group(1)
+    symbol = match.group(2).upper()
+    try:
+        month, day = [int(part) for part in month_day.split("/")]
+        fee_date = datetime(row_date.year, month, day).date()
+        if fee_date > row_date:
+            fee_date = datetime(row_date.year - 1, month, day).date()
+    except Exception:
+        return None, symbol
+    return fee_date, symbol
+
+
+def _parse_eod_date(raw):
+    try:
+        return datetime.strptime(str(raw).strip(), "%m/%d/%y").date()
+    except Exception:
+        return None
+
+
+def _parse_borrow_fee_rows(file_path, debug_info=None):
+    rows = []
+    with open(file_path, "r", encoding="utf-8-sig", errors="ignore", newline="") as f:
+        raw_text = f.read()
+
+    if not raw_text.strip():
+        return rows
+
+    sample = raw_text[:8192]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        header_line = sample.splitlines()[0] if sample else ""
+        delimiters = [",", "\t", ";", "|"]
+        counts = {d: header_line.count(d) for d in delimiters}
+        delimiter = max(counts, key=counts.get) if counts and max(counts.values()) > 0 else ","
+
+    lines = [line for line in raw_text.splitlines() if line.strip()]
+    if debug_info is not None:
+        debug_info["line_count"] = len(lines)
+    header_idx = 0
+    for i, line in enumerate(lines):
+        cols = [c.strip().lower() for c in line.split(delimiter)]
+        if "date" in cols and "description" in cols and "amount" in cols:
+            header_idx = i
+            break
+
+    csv_text = "\n".join(lines[header_idx:])
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=delimiter)
+
+    header_map = {h.strip().lower(): h for h in (reader.fieldnames or []) if h}
+    header_keys = list(header_map.keys())
+    if debug_info is not None:
+        debug_info["delimiter"] = delimiter
+        debug_info["header_keys"] = header_keys
+        debug_info["header_line"] = lines[header_idx] if lines else ""
+        fee_lines = [ln for ln in lines if "STOCK BORROW FEE" in ln.upper()]
+        debug_info["fee_line_count"] = len(fee_lines)
+        debug_info["fee_line_sample"] = fee_lines[0] if fee_lines else ""
+
+    def get_field(row, *names):
+        for name in names:
+            key = header_map.get(name)
+            if key:
+                return row.get(key, "")
+            # fallback: partial match (e.g., "description " or "symbol/cusip")
+            for cand in header_keys:
+                if name in cand:
+                    return row.get(header_map[cand], "")
+        return ""
+
+    total_rows = 0
+    matched_desc = 0
+    parsed_dates = 0
+    parsed_amounts = 0
+    symbol_missing = 0
+    sample_fields = None
+    sample_match = None
+
+    for row in reader:
+        total_rows += 1
+        desc = str(get_field(row, "description")).strip()
+        desc_norm = " ".join(desc.split())
+        if "STOCK BORROW FEE" not in desc_norm.upper():
+            continue
+        matched_desc += 1
+        if sample_match is None:
+            sample_match = {
+                "date": get_field(row, "date"),
+                "description": desc,
+                "amount": get_field(row, "amount"),
+                "symbol": get_field(row, "symbol", "symbol/cusip"),
+            }
+
+        row_date = _parse_fee_date(get_field(row, "date"))
+        if not row_date:
+            continue
+        parsed_dates += 1
+
+        amount = _parse_fee_amount(get_field(row, "amount"))
+        if amount is None:
+            continue
+        parsed_amounts += 1
+
+        desc_date, desc_symbol = _parse_desc_fee_date(desc_norm, row_date)
+        fee_date = desc_date or row_date
+
+        symbol = str(get_field(row, "symbol", "symbol/cusip")).strip().upper()
+        if not symbol:
+            if desc_symbol:
+                symbol = desc_symbol
+            else:
+                match = _BORROW_FEE_RE.search(desc_norm)
+                if match:
+                    symbol = match.group(1).upper()
+                else:
+                    last_token = desc_norm.split()[-1] if desc_norm else ""
+                    if last_token and SYMB_RE.match(last_token):
+                        symbol = last_token
+
+        if not symbol:
+            symbol_missing += 1
+            continue
+
+        rows.append({
+            "symbol": symbol,
+            "date": fee_date,
+            "amount": amount,
+            "description": desc,
+            "date_source": "desc" if desc_date else "row",
+            "row_date": row_date,
+        })
+
+        if sample_fields is None:
+            sample_fields = {
+                "date": get_field(row, "date"),
+                "description": desc,
+                "amount": get_field(row, "amount"),
+                "symbol": get_field(row, "symbol", "symbol/cusip"),
+                "parsed_symbol": symbol,
+                "fee_date": fee_date.strftime("%Y-%m-%d"),
+            }
+
+    if debug_info is not None:
+        debug_info["total_rows"] = total_rows
+        debug_info["matched_desc"] = matched_desc
+        debug_info["parsed_dates"] = parsed_dates
+        debug_info["parsed_amounts"] = parsed_amounts
+        debug_info["symbol_missing"] = symbol_missing
+        debug_info["sample_fields"] = sample_fields
+        debug_info["sample_match"] = sample_match
+
+    return rows
+
+
+def import_borrow_fees_csv(file_path):
+    debug_info = {}
+    fee_rows = _parse_borrow_fee_rows(file_path, debug_info=debug_info)
+    if not fee_rows:
+        debug_bits = [
+            f"delimiter={debug_info.get('delimiter', '?')}",
+            f"header_keys={debug_info.get('header_keys', [])}",
+            f"fee_lines={debug_info.get('fee_line_count', 0)}",
+            f"rows={debug_info.get('total_rows', 0)}",
+            f"desc_match={debug_info.get('matched_desc', 0)}",
+            f"dates={debug_info.get('parsed_dates', 0)}",
+            f"amounts={debug_info.get('parsed_amounts', 0)}",
+            f"symbol_missing={debug_info.get('symbol_missing', 0)}",
+        ]
+        sample = debug_info.get("fee_line_sample", "")
+        if sample:
+            debug_bits.append(f"sample={sample[:200]}")
+        sample_fields = debug_info.get("sample_fields")
+        if sample_fields:
+            debug_bits.append(f"fields={sample_fields}")
+        sample_match = debug_info.get("sample_match")
+        if sample_match:
+            debug_bits.append(f"match={sample_match}")
+        return "No borrow fee rows found in the file. Debug: " + " | ".join(debug_bits)
+
+    desc_date_count = sum(1 for r in fee_rows if r.get("date_source") == "desc")
+    row_date_count = sum(1 for r in fee_rows if r.get("date_source") == "row")
+
+    min_date = min(r["date"] for r in fee_rows)
+    max_date = max(r["date"] for r in fee_rows)
+
+    conn = sqlite3.connect("trades.db")
+    cursor = conn.cursor()
+
+    before = conn.total_changes
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    insert_rows = []
+    delete_rows = []
+    for r in fee_rows:
+        fee_date_str = r["date"].strftime("%Y-%m-%d")
+        insert_rows.append((r["symbol"], fee_date_str, r["amount"], r.get("description", ""), now_ts))
+        if r.get("date_source") == "desc":
+            row_date = r.get("row_date")
+            if row_date and row_date != r["date"]:
+                delete_rows.append(
+                    (
+                        r["symbol"],
+                        row_date.strftime("%Y-%m-%d"),
+                        r["amount"],
+                        r.get("description", ""),
+                    )
+                )
+
+    if delete_rows:
+        cursor.executemany(
+            """
+            DELETE FROM short_fee_history
+            WHERE symbol = ? AND fee_date = ? AND amount = ? AND description = ?
+            """,
+            delete_rows,
+        )
+    cursor.executemany(
+        """
+        INSERT OR IGNORE INTO short_fee_history (symbol, fee_date, amount, description, imported_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        insert_rows,
+    )
+    inserted = conn.total_changes - before
+
+    # Recompute short_fees from history (deduped)
+    cursor.execute("SELECT MAX(fee_date) FROM short_fee_history")
+    max_hist_date_raw = cursor.fetchone()[0]
+    max_hist_date = datetime.strptime(max_hist_date_raw, "%Y-%m-%d").date() if max_hist_date_raw else None
+
+    cursor.execute("SELECT id, symbol, date_first_open, date_start, date_closed FROM eod_shorts")
+    eod_rows = cursor.fetchall()
+
+    updates = []
+    eod_symbols = set()
+    for row_id, symbol, date_first_open, date_start, date_closed in eod_rows:
+        sym = (symbol or "").upper()
+        eod_symbols.add(sym)
+        start_date = _parse_eod_date(date_first_open) or _parse_eod_date(date_start)
+        end_date = _parse_eod_date(date_closed) or max_hist_date
+        if not start_date or not end_date:
+            updates.append((0.0, row_id))
+            continue
+
+        cursor.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0.0)
+            FROM short_fee_history
+            WHERE symbol = ? AND fee_date >= ? AND fee_date <= ?
+            """,
+            (sym, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")),
+        )
+        sum_amount = cursor.fetchone()[0] or 0.0
+        total_fee = -float(sum_amount)
+        updates.append((total_fee, row_id))
+
+    if updates:
+        cursor.executemany("UPDATE eod_shorts SET short_fees = ? WHERE id = ?", updates)
+
+    conn.commit()
+    conn.close()
+
+    missing = sorted(set(r["symbol"] for r in fee_rows) - eod_symbols)
+    msg = (
+        f"Borrow fees imported: {len(fee_rows)} rows, {len(set(r['symbol'] for r in fee_rows))} symbols. "
+        f"Inserted {inserted} new rows. "
+        f"Desc dates used: {desc_date_count}, fallback to row date: {row_date_count}. "
+        f"Date range: {min_date:%Y-%m-%d} to {max_date:%Y-%m-%d}. "
+        f"Updated {len(updates)} cycles."
+    )
+    if missing:
+        preview = ", ".join(missing[:20])
+        suffix = "..." if len(missing) > 20 else ""
+        msg += f" Unknown symbols: {preview}{suffix}."
+    msg += " Open positions use the CSV max date as the end date."
+    return msg
+
+
 def generate_trade_report(trades):
     """
     Generate a fixed-width table for trade summaries using code blocks with emphasized headers.
@@ -1065,18 +1458,18 @@ def update_trade_db(trade):
             # === EOD logic on SELL ===
             if _is_eod_candidate(symbol):
                 # upsert eod_shorts for this open position, reset clock today
-                cursor.execute('SELECT id, total_qty, avg_cost, realized_pl, date_start FROM eod_shorts WHERE symbol = ? AND date_closed IS NULL',
+                cursor.execute('SELECT id, total_qty, avg_cost, realized_pl, date_start, date_first_open FROM eod_shorts WHERE symbol = ? AND date_closed IS NULL',
                                (symbol,))
                 e = cursor.fetchone()
                 if e:
-                    eid, eqty, eavg, erpl, estart = e
+                    eid, eqty, eavg, erpl, estart, eopen = e
                     # Track eod qty/avg to match main book on add
                     cursor.execute('UPDATE eod_shorts SET total_qty = ?, avg_cost = ?, date_start = ? WHERE id = ?',
                                    (new_total_qty, new_avg_cost, _today_mmddyy(), eid))
                 else:
                     cursor.execute(
-                        'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, realized_pl, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?)',
-                        (symbol, new_total_qty, new_avg_cost, 0.0, _today_mmddyy(), None)
+                        'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, short_fees, realized_pl, date_first_open, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        (symbol, new_total_qty, new_avg_cost, 0.0, 0.0, _today_mmddyy(), _today_mmddyy(), None)
                     )
 
         elif action == "BUY":
@@ -1100,11 +1493,11 @@ def update_trade_db(trade):
             # === EOD logic on BUY ===
             if _is_eod_candidate(symbol):
                 # Open EOD row must exist if this was tracked; if not, create it conservatively
-                cursor.execute('SELECT id, total_qty, avg_cost, realized_pl FROM eod_shorts WHERE symbol = ? AND date_closed IS NULL',
+                cursor.execute('SELECT id, total_qty, avg_cost, realized_pl, date_first_open FROM eod_shorts WHERE symbol = ? AND date_closed IS NULL',
                                (symbol,))
                 e = cursor.fetchone()
                 if e:
-                    eid, eqty, eavg, erpl = e
+                    eid, eqty, eavg, erpl, eopen = e
                     # Add the realized P/L for this cover leg into eod_shorts.realized_pl
                     new_erpl = (erpl or 0.0) + realized_trade_pl
                     # After cover, set qty equal to main new_total_qty (kept in sync)
@@ -1119,8 +1512,8 @@ def update_trade_db(trade):
                     # create one to capture realized_pl and close it immediately if qty is now 0.
                     dc = _today_mmddyy() if new_total_qty == 0 else None
                     cursor.execute(
-                        'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, realized_pl, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?)',
-                        (symbol, new_total_qty, avg_cost, realized_trade_pl, _today_mmddyy(), dc)
+                        'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, short_fees, realized_pl, date_first_open, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                        (symbol, new_total_qty, avg_cost, 0.0, realized_trade_pl, _today_mmddyy(), _today_mmddyy(), dc)
                     )
 
         else:
@@ -1137,8 +1530,8 @@ def update_trade_db(trade):
             # === EOD: if in today list, open eod_shorts with fresh clock ===
             if _is_eod_candidate(symbol):
                 cursor.execute(
-                    'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, realized_pl, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?)',
-                    (symbol, qty, price, 0.0, _today_mmddyy(), None)
+                    'INSERT INTO eod_shorts (symbol, total_qty, avg_cost, short_fees, realized_pl, date_first_open, date_start, date_closed) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    (symbol, qty, price, 0.0, 0.0, _today_mmddyy(), _today_mmddyy(), None)
                 )
         else:
             main_msg = f"Error: No position for {symbol} to buy to cover."
@@ -1238,14 +1631,15 @@ async def _run_finviz_and_notify():
     # --- Age checks for open EOD shorts (from eod_shorts) ---
     conn = sqlite3.connect("trades.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT symbol, date_start FROM eod_shorts WHERE date_closed IS NULL")
+    cursor.execute("SELECT symbol, date_first_open, date_start FROM eod_shorts WHERE date_closed IS NULL")
     rows = cursor.fetchall()
     conn.close()
 
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
     five_day, ten_day = [], []
-    for sym, date_start in rows:
-        age = trading_days_between(date_start, now_utc)  # your existing helper
+    for sym, date_first_open, date_start in rows:
+        start_for_age = date_first_open or date_start
+        age = trading_days_between(start_for_age, now_utc)  # your existing helper
         if age >= 10:
             ten_day.append(f"{sym} ({age}d)")
         elif age >= 5:
@@ -1376,13 +1770,13 @@ def _sum_entry_notional_for_cycle(cur, symbol, date_start, date_closed):
     except Exception:
         return None
 
-async def post_eod_summary(client):
+async def post_eod_summary(client, also_send_channel_id=None, send_alert=True):
     conn = sqlite3.connect("trades.db")
     cur  = conn.cursor()
 
     # Open positions (date_closed IS NULL)
     cur.execute("""
-        SELECT symbol, total_qty, avg_cost, date_start
+        SELECT symbol, total_qty, avg_cost, short_fees, date_first_open, date_start
         FROM eod_shorts
         WHERE date_closed IS NULL
         ORDER BY symbol
@@ -1391,20 +1785,20 @@ async def post_eod_summary(client):
 
     # Closed positions for metrics
     cur.execute("""
-        SELECT symbol, realized_pl, date_start, date_closed
+        SELECT symbol, realized_pl, short_fees, date_first_open, date_start, date_closed
         FROM eod_shorts
         WHERE date_closed IS NOT NULL
     """)
     closed_rows = cur.fetchall()
 
     # Format the open holdings table
-    header = f"{'SYMBOL':<7} {'SHARES':>7}   {'AVG COST':>8}   {'DAYS':>4}"
+    header = f"{'SYMBOL':<7} {'SHARES':>7}   {'AVG COST':>8}   {'FEES':>8}   {'DAYS':>4}"
     dash   = "-" * len(header)
     lines  = [header, dash]
 
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
 
-    for sym, qty, avg_cost, ds in open_rows:
+    for sym, qty, avg_cost, short_fees, d_open, ds in open_rows:
         # Display DB quantity verbatim (shorts negative, longs positive)
         try:
             qty_display = f"{int(qty)}"
@@ -1412,8 +1806,10 @@ async def post_eod_summary(client):
             qty_display = "0"
 
         price_str = f"${float(avg_cost):.2f}" if avg_cost is not None else "$0.00"
+        fees_str = f"${float(short_fees or 0):.2f}"
+        start_for_days = d_open or ds
         lines.append(
-            f"{sym:<7} {qty_display:>7}   {price_str:>8}   {trading_days_between(ds, now_utc):>4}"
+            f"{sym:<7} {qty_display:>7}   {price_str:>8}   {fees_str:>8}   {trading_days_between(start_for_days, now_utc):>4}"
         )
 
 
@@ -1424,15 +1820,20 @@ async def post_eod_summary(client):
     win_bools      = []
     per_pos_pct    = []  # per-position percent returns
     total_realized = 0.0
+    total_fees     = 0.0
 
-    for sym, realized_pl, ds, de in closed_rows:
+    for sym, realized_pl, short_fees, d_open, ds, de in closed_rows:
         realized = float(realized_pl or 0.0)
-        total_realized += realized
-        win_bools.append(realized > 0)
+        fees = float(short_fees or 0.0)
+        net_realized = realized - fees
+        total_realized += net_realized
+        total_fees += fees
+        win_bools.append(net_realized > 0)
 
-        entry_notional = _sum_entry_notional_for_cycle(cur, sym, ds, de)
+        start_for_cycle = d_open or ds
+        entry_notional = _sum_entry_notional_for_cycle(cur, sym, start_for_cycle, de)
         if entry_notional and entry_notional > 0:
-            per_pos_pct.append(100.0 * (realized / entry_notional))
+            per_pos_pct.append(100.0 * (net_realized / entry_notional))
         # else: leave it out of % average if we can’t determine basis confidently
 
     n_closed  = len(closed_rows)
@@ -1441,8 +1842,14 @@ async def post_eod_summary(client):
     avg_pct   = ((total_realized / (n_closed * 1000.0)) * 100.0) if n_closed else None
     
     # --- NEW: separate winner/loser averages using $1,000 base per closed trade ---
-    win_amounts   = [pl for (_sym, pl, *_r) in closed_rows if pl is not None and pl > 0]
-    loss_amounts  = [(-pl) for (_sym, pl, *_r) in closed_rows if pl is not None and pl < 0]
+    win_amounts   = []
+    loss_amounts  = []
+    for _sym, pl, sf, *_r in closed_rows:
+        net_pl = float(pl or 0.0) - float(sf or 0.0)
+        if net_pl > 0:
+            win_amounts.append(net_pl)
+        elif net_pl < 0:
+            loss_amounts.append(-net_pl)
     n_wins_only   = len(win_amounts)
     n_losses_only = len(loss_amounts)
     avg_profit_pct = ((sum(win_amounts)  / (n_wins_only   * 1000.0)) * 100.0) if n_wins_only   else None
@@ -1458,7 +1865,8 @@ async def post_eod_summary(client):
         f"Win rate: {win_rate:.1f}%",
         f"{'Average % Profit:':<{label_w}} " + (f"{avg_profit_pct:.2f}%" if avg_profit_pct is not None else "n/a"),
         f"{'Average % Loss:':<{label_w}} "   + (f"{avg_loss_pct:.2f}%"   if avg_loss_pct   is not None else "n/a"),
-        f"Total P/L $: ${total_realized:,.2f}",
+        f"Borrow fees: ${total_fees:,.2f}",
+        f"Total Net P/L: ${total_realized:,.2f}",
     ]
     metrics_block = "\n".join(metrics_lines)
 
@@ -1466,15 +1874,27 @@ async def post_eod_summary(client):
 
     conn.close()
 
-    # Post only to ALERT_CHANNEL_ID
-    channel = client.get_channel(ALERT_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await client.fetch_channel(ALERT_CHANNEL_ID)
-        except Exception:
-            channel = None
-    if channel:
-        await channel.send(msg)
+    # Post to alert channel (optional)
+    if send_alert:
+        channel = client.get_channel(ALERT_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(ALERT_CHANNEL_ID)
+            except Exception:
+                channel = None
+        if channel:
+            await channel.send(msg)
+
+    # Optionally also post to a secondary channel (e.g., source channel for testing)
+    if also_send_channel_id and also_send_channel_id != ALERT_CHANNEL_ID:
+        extra = client.get_channel(also_send_channel_id)
+        if extra is None:
+            try:
+                extra = await client.fetch_channel(also_send_channel_id)
+            except Exception:
+                extra = None
+        if extra:
+            await extra.send(msg)
 
 def get_all_positions():
     """
