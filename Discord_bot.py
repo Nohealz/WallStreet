@@ -27,8 +27,17 @@ SOURCE_CHANNEL_ID = int(config('SOURCE_CHANNEL_ID'))  # Channel for posting scre
 ALERT_CHANNEL_ID = int(config('ALERT_CHANNEL_ID'))
 SERVER_ID = int(config('SERVER_ID'))
 
+def _normalize_env_path(value: str) -> str:
+    s = (value or "").strip()
+    # Accept values like r"C:\path\file.py" and plain quoted strings in .env
+    if len(s) >= 3 and s[0] in ("r", "R") and s[1] in ("'", '"') and s[-1] == s[1]:
+        s = s[2:-1]
+    elif len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
+        s = s[1:-1]
+    return os.path.expandvars(os.path.expanduser(s))
+
 # absolute path to your finviz screener
-FINVIZ_SCRIPT_PATH = config('FINVIZ_SCRIPT_PATH')
+FINVIZ_SCRIPT_PATH = _normalize_env_path(config('FINVIZ_SCRIPT_PATH'))
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -227,6 +236,7 @@ async def on_message(message):
 - `!text` — Broadcast a message to all bound channels.
 - `!positions` – Display all current positions.
 - `!summary [YYYY-MM-DD] [--local]` – Daily summary for the given date (default: today). `--local` skips the alert channel and posts EOD summary only to the source channel.
+- `!eodrun` - Manually run the scheduled EOD screener now (admin only).
 - `!fees` – Upload broker activity CSV/TSV to import short borrow fees (admin only).
 - `!eod` – Post the EOD strategy summary (open holdings + closed-trade metrics) to the alert channel.
 - `!bind <description>` — Bind the current channel for relaying messages (admin only).
@@ -268,6 +278,18 @@ async def on_message(message):
             if bot_state.relay_enabled:
                 await relay_to_bound_channels(positions_report)
             await source_channel.send(positions_report)
+
+
+        elif message.content.strip().lower() == "!eodrun":
+            if message.author.id != AUTHORIZED_USER:
+                await source_channel.send("You are not authorized to use this command.")
+                return
+            await source_channel.send("Running EOD screener now...")
+            try:
+                await _run_finviz_and_notify()
+                await source_channel.send("EOD screener run complete.")
+            except Exception as e:
+                await source_channel.send(f"@here Manual EOD screener run failed: {e}")
 
         # Trigger the daily summary command
         elif message.content.startswith("!summary"):
@@ -1605,9 +1627,15 @@ async def _run_finviz_and_notify():
         )
         stdout, stderr = await proc.communicate()
         output = stdout.decode(errors="ignore")
+        err_output = stderr.decode(errors="ignore").strip()
     except Exception as e:
         print(f"[finviz] ERROR running finviz_screener.py: {e}")
         return
+
+    if proc.returncode != 0:
+        print(f"[finviz] ERROR screener exit code: {proc.returncode}")
+        if err_output:
+            print(f"[finviz] stderr:\n{err_output}")
 
     # Parse: lines like "Tickers: ['FMC', 'APLS']" and "ETF_FLAGS: {'FMC': False, 'APLS': True}"
     tickers = []
@@ -1616,14 +1644,27 @@ async def _run_finviz_and_notify():
         stripped = line.strip()
         if stripped.startswith("Tickers:"):
             try:
-                tickers = ast.literal_eval(stripped.split("Tickers:", 1)[1].strip())
+                parsed = ast.literal_eval(stripped.split("Tickers:", 1)[1].strip())
+                if isinstance(parsed, (list, tuple, set)):
+                    tickers = list(parsed)
+                elif isinstance(parsed, str):
+                    tickers = [parsed]
+                else:
+                    tickers = []
             except Exception:
                 tickers = []
         elif stripped.startswith("ETF_FLAGS:"):
             try:
-                etf_flags = ast.literal_eval(stripped.split("ETF_FLAGS:", 1)[1].strip())
+                parsed_flags = ast.literal_eval(stripped.split("ETF_FLAGS:", 1)[1].strip())
+                etf_flags = parsed_flags if isinstance(parsed_flags, dict) else {}
             except Exception:
                 etf_flags = {}
+
+    if not tickers:
+        tail = "\n".join(output.splitlines()[-10:])
+        print(f"[finviz] WARNING no tickers parsed. stdout tail:\n{tail}")
+        if err_output:
+            print(f"[finviz] stderr tail:\n{err_output[-1000:]}")
 
     # Keep today's Finviz set in memory (no DB watchlist)
     bot_state.finviz_today = [s.strip() for s in tickers if isinstance(s, str)]
